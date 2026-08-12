@@ -1061,6 +1061,10 @@ void process_shaders() {
 
     string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", {});
 
+    string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
+    string_to_spv("dsv4_hc_pre_f32", "dsv4_hc_pre.comp", {});
+    string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+
     string_to_spv("rwkv_wkv7_f32", "wkv7.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 
     string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}}));

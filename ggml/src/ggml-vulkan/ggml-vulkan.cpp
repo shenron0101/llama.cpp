@@ -783,6 +783,11 @@ static bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type) {
     return std::find(lightning_indexer_k_types.begin(), lightning_indexer_k_types.end(), type) != lightning_indexer_k_types.end();
 }
 
+static constexpr uint32_t dsv4_hc_count = 4;
+static constexpr uint32_t dsv4_hc_mix_dim = (2 + dsv4_hc_count) * dsv4_hc_count;
+static constexpr uint32_t dsv4_hc_local_size = 128;
+
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     mutable std::shared_mutex pinned_memory_mutex;
@@ -1079,6 +1084,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_gated_linear_attn_f32;
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_dsv4_hc_comb_f32;
+    vk_pipeline pipeline_dsv4_hc_pre_f32;
+    vk_pipeline pipeline_dsv4_hc_post_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
@@ -1879,6 +1887,40 @@ struct vk_op_lightning_indexer_push_constants {
 };
 static_assert(sizeof(vk_op_lightning_indexer_push_constants) == 17 * sizeof(uint32_t));
 static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
+struct vk_op_dsv4_hc_comb_push_constants {
+    uint32_t n_tokens;
+    uint32_t dispatch_x;
+    uint32_t m_nb1;
+    uint32_t d_nb1;
+    uint32_t d_nb2;
+    float eps;
+    uint32_t n_iter;
+};
+static_assert(sizeof(vk_op_dsv4_hc_comb_push_constants) == 7 * sizeof(uint32_t));
+struct vk_op_dsv4_hc_pre_push_constants {
+    uint32_t n_outputs;
+    uint32_t n_embd;
+    uint32_t dispatch_x;
+    uint32_t x_nb1;
+    uint32_t x_nb2;
+    uint32_t w_nb1;
+    uint32_t d_nb1;
+};
+static_assert(sizeof(vk_op_dsv4_hc_pre_push_constants) == 7 * sizeof(uint32_t));
+struct vk_op_dsv4_hc_post_push_constants {
+    uint32_t n_outputs;
+    uint32_t n_embd;
+    uint32_t dispatch_x;
+    uint32_t x_nb1;
+    uint32_t r_nb1;
+    uint32_t r_nb2;
+    uint32_t p_nb1;
+    uint32_t c_nb1;
+    uint32_t c_nb2;
+    uint32_t d_nb1;
+    uint32_t d_nb2;
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) == 11 * sizeof(uint32_t));
 struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;
@@ -5845,6 +5887,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t block_bytes = k_type == GGML_TYPE_F32 ? 4 * sizeof(float) : (uint32_t)ggml_type_size(k_type);
         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, block_bytes}, 1);
     }
+
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32, "dsv4_hc_pre_f32", dsv4_hc_pre_f32_len, dsv4_hc_pre_f32_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {1, 1, 1}, {}, 1);
 
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
@@ -11604,6 +11650,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_DSV4_HC_COMB:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dsv4_hc_comb_f32;
+        }
+        return nullptr;
+    case GGML_OP_DSV4_HC_PRE:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dsv4_hc_pre_f32;
+        }
+        return nullptr;
+    case GGML_OP_DSV4_HC_POST:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->src[3]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dsv4_hc_post_f32;
+        }
+        return nullptr;
     case GGML_OP_GATED_DELTA_NET:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
@@ -12706,6 +12767,100 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, m), ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {dispatch_x, dispatch_y, 1});
+}
+
+static void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, mixes, scale, base, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_tokens = (uint32_t)mixes->ne[1];
+    const uint32_t n_workgroups = 1 + (n_tokens - 1) / dsv4_hc_local_size;
+    const uint32_t dispatch_x = std::min(n_workgroups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    const uint32_t dispatch_y = 1 + (n_workgroups - 1) / dispatch_x;
+
+    const vk_op_dsv4_hc_comb_push_constants pc = {
+        n_tokens,
+        dispatch_x,
+        (uint32_t)(mixes->nb[1] / sizeof(float)),
+        (uint32_t)(dst->nb[1] / sizeof(float)),
+        (uint32_t)(dst->nb[2] / sizeof(float)),
+        ggml_get_op_params_f32(dst, 0),
+        (uint32_t)ggml_get_op_params_i32(dst, 1),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, mixes), ggml_vk_tensor_subbuffer(ctx, scale), ggml_vk_tensor_subbuffer(ctx, base), ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {dispatch_x, dispatch_y, 1});
+}
+
+static void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, x, weights, nullptr, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_outputs = (uint32_t)((uint64_t)dst->ne[0] * (uint64_t)dst->ne[1]);
+    const uint32_t n_workgroups = 1 + (n_outputs - 1) / dsv4_hc_local_size;
+    const uint32_t dispatch_x = std::min(n_workgroups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    const uint32_t dispatch_y = 1 + (n_workgroups - 1) / dispatch_x;
+
+    const vk_op_dsv4_hc_pre_push_constants pc = {
+        n_outputs,
+        (uint32_t)x->ne[0],
+        dispatch_x,
+        (uint32_t)(x->nb[1] / sizeof(float)),
+        (uint32_t)(x->nb[2] / sizeof(float)),
+        (uint32_t)(weights->nb[1] / sizeof(float)),
+        (uint32_t)(dst->nb[1] / sizeof(float)),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, weights), ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {dispatch_x, dispatch_y, 1});
+}
+
+static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * comb     = dst->src[3];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, x, residual, post, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_outputs = (uint32_t)((uint64_t)dst->ne[0] * (uint64_t)dst->ne[1] * (uint64_t)dst->ne[2]);
+    const uint32_t n_workgroups = 1 + (n_outputs - 1) / dsv4_hc_local_size;
+    const uint32_t dispatch_x = std::min(n_workgroups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    const uint32_t dispatch_y = 1 + (n_workgroups - 1) / dispatch_x;
+
+    const vk_op_dsv4_hc_post_push_constants pc = {
+        n_outputs,
+        (uint32_t)x->ne[0],
+        dispatch_x,
+        (uint32_t)(x->nb[1] / sizeof(float)),
+        (uint32_t)(residual->nb[1] / sizeof(float)),
+        (uint32_t)(residual->nb[2] / sizeof(float)),
+        (uint32_t)(post->nb[1] / sizeof(float)),
+        (uint32_t)(comb->nb[1] / sizeof(float)),
+        (uint32_t)(comb->nb[2] / sizeof(float)),
+        (uint32_t)(dst->nb[1] / sizeof(float)),
+        (uint32_t)(dst->nb[2] / sizeof(float)),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, post), ggml_vk_tensor_subbuffer(ctx, comb), ggml_vk_tensor_subbuffer(ctx, dst)},
         pc, {dispatch_x, dispatch_y, 1});
 }
 
@@ -15718,6 +15873,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_DSV4_HC_COMB:
+        ggml_vk_dsv4_hc_comb(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_DSV4_HC_PRE:
+        ggml_vk_dsv4_hc_pre(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_DSV4_HC_POST:
+        ggml_vk_dsv4_hc_post(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
@@ -17973,6 +18143,42 @@ static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_d
     return ctx->is_integrated_gpu ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
+static bool ggml_vk_f32_element_stride_supported(size_t stride) {
+    return stride % sizeof(float) == 0 && stride / sizeof(float) <= std::numeric_limits<uint32_t>::max();
+}
+
+static bool ggml_vk_max_f32_element_index_supported(const ggml_tensor * tensor, const std::initializer_list<int> & dims) {
+    const uint64_t uint32_max = std::numeric_limits<uint32_t>::max();
+    uint64_t index = 0;
+    for (int dim : dims) {
+        const uint64_t stride = tensor->nb[dim] / sizeof(float);
+        const uint64_t extent = (uint64_t)tensor->ne[dim] - 1;
+        if (extent != 0 && stride > (uint32_max - index) / extent) {
+            return false;
+        }
+        index += extent * stride;
+    }
+    return index <= uint32_max;
+}
+
+static bool ggml_vk_flattened_2d_dispatch_supported(const vk_device & device, uint64_t n_workgroups, uint32_t local_size) {
+    if (n_workgroups == 0 || local_size == 0) {
+        return false;
+    }
+
+    const uint64_t dispatch_x = std::min<uint64_t>(n_workgroups, device->properties.limits.maxComputeWorkGroupCount[0]);
+    if (dispatch_x == 0) {
+        return false;
+    }
+    const uint64_t dispatch_y = 1 + (n_workgroups - 1) / dispatch_x;
+    if (dispatch_y > device->properties.limits.maxComputeWorkGroupCount[1]) {
+        return false;
+    }
+
+    const uint64_t max_invocations = (uint64_t)std::numeric_limits<uint32_t>::max() + 1;
+    return dispatch_x <= max_invocations / local_size / dispatch_y;
+}
+
 static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
 
@@ -18586,6 +18792,187 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const uint64_t dispatch_y = (n_outputs + dispatch_x - 1) / dispatch_x;
                 return dispatch_x > 0 && dispatch_y <= device->properties.limits.maxComputeWorkGroupCount[1] &&
                     dispatch_x * dispatch_y - 1 <= std::numeric_limits<uint32_t>::max();
+            }
+        case GGML_OP_DSV4_HC_COMB:
+            {
+                const ggml_tensor * mixes = op->src[0];
+                const ggml_tensor * scale = op->src[1];
+                const ggml_tensor * base  = op->src[2];
+                if (!mixes || !scale || !base ||
+                    mixes->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+                    base->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                    device->properties.limits.maxComputeWorkGroupInvocations < dsv4_hc_local_size ||
+                    device->properties.limits.maxComputeWorkGroupSize[0] < dsv4_hc_local_size) {
+                    return false;
+                }
+
+                if (mixes->ne[0] != dsv4_hc_mix_dim || mixes->ne[2] != 1 || mixes->ne[3] != 1 ||
+                    scale->ne[0] < 3 || scale->ne[1] != 1 || scale->ne[2] != 1 || scale->ne[3] != 1 ||
+                    base->ne[0] != dsv4_hc_mix_dim || base->ne[1] != 1 || base->ne[2] != 1 || base->ne[3] != 1 ||
+                    op->ne[0] != dsv4_hc_count || op->ne[1] != dsv4_hc_count ||
+                    op->ne[2] != mixes->ne[1] || op->ne[3] != 1) {
+                    return false;
+                }
+
+                const ggml_tensor * tensors[] = {mixes, scale, base, op};
+                for (const ggml_tensor * tensor : tensors) {
+                    if (tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] <= 0 || tensor->ne[3] <= 0 ||
+                        tensor->nb[0] != sizeof(float) ||
+                        !storage_buffer_offset_aligned(tensor) ||
+                        ggml_nbytes(tensor) > device->properties.limits.maxStorageBufferRange) {
+                        return false;
+                    }
+                }
+
+                if (!ggml_vk_f32_element_stride_supported(mixes->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(op->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(op->nb[2])) {
+                    return false;
+                }
+
+                const uint64_t uint32_max = std::numeric_limits<uint32_t>::max();
+                if ((uint64_t)mixes->ne[1] > uint32_max) {
+                    return false;
+                }
+
+                if (!ggml_vk_max_f32_element_index_supported(mixes, {0, 1}) ||
+                    !ggml_vk_max_f32_element_index_supported(scale, {0}) ||
+                    !ggml_vk_max_f32_element_index_supported(base, {0}) ||
+                    !ggml_vk_max_f32_element_index_supported(op, {0, 1, 2})) {
+                    return false;
+                }
+
+                const int32_t n_iter = ggml_get_op_params_i32(op, 1);
+                const float eps = ggml_get_op_params_f32(op, 0);
+                if (n_iter <= 0 || !std::isfinite(eps) || eps < 0.0f) {
+                    return false;
+                }
+
+                const uint64_t n_workgroups = ((uint64_t)mixes->ne[1] + dsv4_hc_local_size - 1) / dsv4_hc_local_size;
+                return ggml_vk_flattened_2d_dispatch_supported(device, n_workgroups, dsv4_hc_local_size);
+            }
+        case GGML_OP_DSV4_HC_PRE:
+            {
+                const ggml_tensor * x       = op->src[0];
+                const ggml_tensor * weights = op->src[1];
+                if (!x || !weights ||
+                    x->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                    device->properties.limits.maxComputeWorkGroupInvocations < dsv4_hc_local_size ||
+                    device->properties.limits.maxComputeWorkGroupSize[0] < dsv4_hc_local_size) {
+                    return false;
+                }
+
+                if (x->ne[1] != dsv4_hc_count || x->ne[3] != 1 ||
+                    weights->ne[0] != x->ne[1] || weights->ne[1] != x->ne[2] ||
+                    weights->ne[2] != 1 || weights->ne[3] != 1 ||
+                    op->ne[0] != x->ne[0] || op->ne[1] != x->ne[2] || op->ne[2] != 1 || op->ne[3] != 1) {
+                    return false;
+                }
+
+                const ggml_tensor * tensors[] = {x, weights, op};
+                for (const ggml_tensor * tensor : tensors) {
+                    if (tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] <= 0 || tensor->ne[3] <= 0 ||
+                        tensor->nb[0] != sizeof(float) || !storage_buffer_offset_aligned(tensor)) {
+                        return false;
+                    }
+                }
+
+                if (!ggml_vk_f32_element_stride_supported(x->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(x->nb[2]) ||
+                    !ggml_vk_f32_element_stride_supported(weights->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(op->nb[1])) {
+                    return false;
+                }
+
+                const uint64_t uint32_max = std::numeric_limits<uint32_t>::max();
+                if ((uint64_t)x->ne[0] > uint32_max || (uint64_t)x->ne[2] > uint32_max ||
+                    (uint64_t)x->ne[0] > uint32_max / (uint64_t)x->ne[2]) {
+                    return false;
+                }
+
+                if (!ggml_vk_max_f32_element_index_supported(x, {0, 1, 2}) ||
+                    !ggml_vk_max_f32_element_index_supported(weights, {0, 1}) ||
+                    !ggml_vk_max_f32_element_index_supported(op, {0, 1})) {
+                    return false;
+                }
+
+                for (const ggml_tensor * tensor : tensors) {
+                    if (ggml_nbytes(tensor) > device->properties.limits.maxStorageBufferRange) {
+                        return false;
+                    }
+                }
+
+                const uint64_t n_outputs = (uint64_t)op->ne[0] * (uint64_t)op->ne[1];
+                if (n_outputs > uint32_max) {
+                    return false;
+                }
+                const uint64_t n_workgroups = (n_outputs + dsv4_hc_local_size - 1) / dsv4_hc_local_size;
+                return ggml_vk_flattened_2d_dispatch_supported(device, n_workgroups, dsv4_hc_local_size);
+            }
+        case GGML_OP_DSV4_HC_POST:
+            {
+                const ggml_tensor * x        = op->src[0];
+                const ggml_tensor * residual = op->src[1];
+                const ggml_tensor * post     = op->src[2];
+                const ggml_tensor * comb     = op->src[3];
+                if (!x || !residual || !post || !comb ||
+                    x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 ||
+                    post->type != GGML_TYPE_F32 || comb->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                    device->properties.limits.maxComputeWorkGroupInvocations < dsv4_hc_local_size ||
+                    device->properties.limits.maxComputeWorkGroupSize[0] < dsv4_hc_local_size) {
+                    return false;
+                }
+
+                if (x->ne[2] != 1 || x->ne[3] != 1 ||
+                    residual->ne[0] != x->ne[0] || residual->ne[1] != dsv4_hc_count ||
+                    residual->ne[2] != x->ne[1] || residual->ne[3] != 1 ||
+                    post->ne[0] != dsv4_hc_count || post->ne[1] != x->ne[1] || post->ne[2] != 1 || post->ne[3] != 1 ||
+                    comb->ne[0] != dsv4_hc_count || comb->ne[1] != dsv4_hc_count ||
+                    comb->ne[2] != x->ne[1] || comb->ne[3] != 1 ||
+                    op->ne[0] != x->ne[0] || op->ne[1] != dsv4_hc_count ||
+                    op->ne[2] != x->ne[1] || op->ne[3] != 1) {
+                    return false;
+                }
+
+                const ggml_tensor * tensors[] = {x, residual, post, comb, op};
+                for (const ggml_tensor * tensor : tensors) {
+                    if (tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] <= 0 || tensor->ne[3] <= 0 ||
+                        tensor->nb[0] != sizeof(float) ||
+                        !storage_buffer_offset_aligned(tensor) ||
+                        ggml_nbytes(tensor) > device->properties.limits.maxStorageBufferRange) {
+                        return false;
+                    }
+                }
+
+                if (!ggml_vk_f32_element_stride_supported(x->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(residual->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(residual->nb[2]) ||
+                    !ggml_vk_f32_element_stride_supported(post->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(comb->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(comb->nb[2]) ||
+                    !ggml_vk_f32_element_stride_supported(op->nb[1]) ||
+                    !ggml_vk_f32_element_stride_supported(op->nb[2])) {
+                    return false;
+                }
+
+                if (!ggml_vk_max_f32_element_index_supported(x, {0, 1}) ||
+                    !ggml_vk_max_f32_element_index_supported(residual, {0, 1, 2}) ||
+                    !ggml_vk_max_f32_element_index_supported(post, {0, 1}) ||
+                    !ggml_vk_max_f32_element_index_supported(comb, {0, 1, 2}) ||
+                    !ggml_vk_max_f32_element_index_supported(op, {0, 1, 2})) {
+                    return false;
+                }
+
+                const uint64_t uint32_max = std::numeric_limits<uint32_t>::max();
+                uint64_t n_outputs = 1;
+                for (int dim : {0, 1, 2}) {
+                    if ((uint64_t)op->ne[dim] > uint32_max / n_outputs) {
+                        return false;
+                    }
+                    n_outputs *= (uint64_t)op->ne[dim];
+                }
+                const uint64_t n_workgroups = (n_outputs + dsv4_hc_local_size - 1) / dsv4_hc_local_size;
+                return ggml_vk_flattened_2d_dispatch_supported(device, n_workgroups, dsv4_hc_local_size);
             }
         case GGML_OP_GATED_DELTA_NET:
             {
@@ -19582,6 +19969,13 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             src_clone[2], src_clone[3], src_clone[4], op_params[0]);
         } else if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
             tensor_clone = ggml_lightning_indexer(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
+        } else if (tensor->op == GGML_OP_DSV4_HC_COMB) {
+            tensor_clone = ggml_dsv4_hc_comb(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_i32(tensor, 1));
+        } else if (tensor->op == GGML_OP_DSV4_HC_PRE) {
+            tensor_clone = ggml_dsv4_hc_pre(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
+            tensor_clone = ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
             tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
             src_clone[2], src_clone[3], src_clone[4], src_clone[5],

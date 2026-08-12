@@ -1200,6 +1200,12 @@ struct test_case {
         }
     }
 
+    virtual bool compare_output_padding(ggml_tensor * output1, ggml_tensor * output2) {
+        GGML_UNUSED(output1);
+        GGML_UNUSED(output2);
+        return true;
+    }
+
     virtual size_t op_size(ggml_tensor * t) {
         size_t size = ggml_nbytes(t);
         // add source tensors
@@ -1418,6 +1424,7 @@ struct test_case {
             test_case * tc;
             ggml_backend_t backend1;
             ggml_backend_t backend2;
+            ggml_tensor * out;
         };
 
         callback_userdata ud {
@@ -1425,6 +1432,7 @@ struct test_case {
             this,
             backend1,
             backend2,
+            out,
         };
 
         auto callback = [](int index, ggml_tensor * t1, ggml_tensor * t2, void * user_data) -> bool {
@@ -1444,6 +1452,11 @@ struct test_case {
                     ud->ok = false;
                     return true;
                 }
+            }
+
+            if (t1 == ud->out && !ud->tc->compare_output_padding(t1, t2)) {
+                ud->ok = false;
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
@@ -3766,8 +3779,13 @@ struct test_snake_fuse : public test_case {
 
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
+    static constexpr uint32_t output_padding_canary = 0x4b7fffffU;
 
     ggml_tensor * out = nullptr;
+
+    virtual bool large_logits_case() const {
+        return false;
+    }
 
     static uint32_t tensor_seed(const ggml_tensor * t) {
         uint32_t seed = 2166136261u;
@@ -3782,15 +3800,21 @@ struct test_dsv4_hc : public test_case {
         return seed;
     }
 
-    static bool tensor_range(const std::string & name, float & lo, float & hi) {
+    bool tensor_range(const std::string & name, float & lo, float & hi) const {
         if (name == "mixes") {
-            lo = -2.0f; hi = 2.0f; return true;
+            lo = large_logits_case() ? -128.0f : -2.0f;
+            hi = large_logits_case() ?  128.0f :  2.0f;
+            return true;
         }
         if (name == "scale") {
-            lo = -0.5f; hi = 0.5f; return true;
+            lo = large_logits_case() ? 32.0f : -0.5f;
+            hi = large_logits_case() ? 32.0f :  0.5f;
+            return true;
         }
         if (name == "base") {
-            lo = -0.25f; hi = 0.25f; return true;
+            lo = large_logits_case() ? -64.0f : -0.25f;
+            hi = large_logits_case() ?  64.0f :  0.25f;
+            return true;
         }
         if (name == "weights" || name == "comb") {
             lo = 0.0f; hi = 1.0f; return true;
@@ -3807,6 +3831,16 @@ struct test_dsv4_hc : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             const std::string name = ggml_get_name(t);
+            if (name == "out_backing") {
+                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_nbytes(t) % sizeof(uint32_t) == 0);
+                std::vector<uint32_t> data(ggml_nbytes(t) / sizeof(uint32_t), output_padding_canary);
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                continue;
+            }
+            if (name == "out" && t->view_src != nullptr) {
+                continue;
+            }
+
             float lo;
             float hi;
             if (!tensor_range(name, lo, hi)) {
@@ -3817,12 +3851,57 @@ struct test_dsv4_hc : public test_case {
             GGML_ASSERT(t->type == GGML_TYPE_F32);
             std::mt19937 rng(tensor_seed(t));
             std::uniform_real_distribution<float> dist(lo, hi);
-            std::vector<float> data(ggml_nelements(t));
-            for (float & v : data) {
-                v = dist(rng);
+            std::vector<float> data(ggml_nbytes(t) / sizeof(float));
+            for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+                for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                            const size_t index = (i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3]) / sizeof(float);
+                            data[index] = dist(rng);
+                        }
+                    }
+                }
             }
-            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
         }
+    }
+
+    bool compare_output_padding(ggml_tensor * output1, ggml_tensor * output2) override {
+        if (output1->view_src == nullptr) {
+            return true;
+        }
+
+        GGML_ASSERT(output2->view_src != nullptr);
+        const size_t backing_size = ggml_nbytes(output1->view_src);
+        GGML_ASSERT(ggml_nbytes(output2->view_src) == backing_size);
+
+        std::vector<uint8_t> data1(backing_size);
+        std::vector<uint8_t> data2(backing_size);
+        std::vector<uint8_t> logical(backing_size, 0);
+        ggml_backend_tensor_get(output1->view_src, data1.data(), 0, backing_size);
+        ggml_backend_tensor_get(output2->view_src, data2.data(), 0, backing_size);
+
+        for (int64_t i3 = 0; i3 < output1->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < output1->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < output1->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < output1->ne[0]; ++i0) {
+                        const size_t offset = output1->view_offs + i0*output1->nb[0] + i1*output1->nb[1] + i2*output1->nb[2] + i3*output1->nb[3];
+                        GGML_ASSERT(offset + sizeof(float) <= logical.size());
+                        std::fill_n(logical.begin() + offset, sizeof(float), 1);
+                    }
+                }
+            }
+        }
+
+        std::array<uint8_t, sizeof(output_padding_canary)> canary;
+        memcpy(canary.data(), &output_padding_canary, canary.size());
+        for (size_t i = 0; i < backing_size; ++i) {
+            if (!logical[i] && (data1[i] != canary[i % canary.size()] || data2[i] != canary[i % canary.size()])) {
+                printf("output padding mismatch at byte %zu ", i);
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -3830,6 +3909,8 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     const int64_t n_tokens;
     const int32_t n_iter;
     const float eps;
+    const bool padded;
+    const bool large_logits;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3837,23 +3918,74 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_tokens, n_iter, eps);
+        return VARS_TO_STR5(n_tokens, n_iter, eps, padded, large_logits);
     }
 
-    test_dsv4_hc_comb(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f)
-        : n_tokens(n_tokens), n_iter(n_iter), eps(eps) {}
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        GGML_ASSERT(n_tokens > 0 && n_iter > 0);
+        const uint64_t n = uint64_t(hc);
+        const uint64_t softmax_flops = 7*n*n + n;
+        const uint64_t norm_flops = 2*n*n + n;
+        const uint64_t norm_passes = 2*uint64_t(n_iter) - 1;
+        return uint64_t(n_tokens) * (softmax_flops + norm_passes*norm_flops);
+    }
+
+    test_dsv4_hc_comb(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f, bool padded = false, bool large_logits = false)
+        : n_tokens(n_tokens), n_iter(n_iter), eps(eps), padded(padded), large_logits(large_logits) {}
+
+    bool large_logits_case() const override {
+        return large_logits;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
+        constexpr size_t view_offs = 256;
+        constexpr int64_t offset_padding = view_offs / sizeof(float);
+        constexpr int64_t hc_mix_dim = (2 + hc)*hc;
+
+        ggml_tensor * mixes;
+        if (padded) {
+            ggml_tensor * mixes_backing = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_mix_dim + 3 + offset_padding, n_tokens);
+            ggml_set_name(mixes_backing, "mixes_backing");
+            mixes = ggml_view_2d(ctx, mixes_backing, hc_mix_dim, n_tokens, mixes_backing->nb[1], view_offs);
+        } else {
+            mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_mix_dim, n_tokens);
+        }
         ggml_set_name(mixes, "mixes");
 
-        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_tensor * scale;
+        if (padded) {
+            ggml_tensor * scale_backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3 + offset_padding);
+            ggml_set_name(scale_backing, "scale_backing");
+            scale = ggml_view_1d(ctx, scale_backing, 3, view_offs);
+        } else {
+            scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        }
         ggml_set_name(scale, "scale");
 
-        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_tensor * base;
+        if (padded) {
+            ggml_tensor * base_backing = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_mix_dim + offset_padding);
+            ggml_set_name(base_backing, "base_backing");
+            base = ggml_view_1d(ctx, base_backing, hc_mix_dim, view_offs);
+        } else {
+            base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_mix_dim);
+        }
         ggml_set_name(base, "base");
 
-        out = ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, n_iter);
+        if (padded) {
+            ggml_tensor * out_backing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc + 5 + offset_padding, hc + 3, n_tokens);
+            ggml_set_name(out_backing, "out_backing");
+            out = ggml_view_3d(ctx, out_backing, hc, hc, n_tokens, out_backing->nb[1], out_backing->nb[2], view_offs);
+            ggml_set_op_params_f32(out, 0, eps);
+            ggml_set_op_params_i32(out, 1, n_iter);
+            out->op = GGML_OP_DSV4_HC_COMB;
+            out->src[0] = mixes;
+            out->src[1] = scale;
+            out->src[2] = base;
+        } else {
+            out = ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, n_iter);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -3862,6 +3994,7 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
+    const bool padded;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3869,20 +4002,52 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR2(n_embd, n_tokens);
+        return VARS_TO_STR3(n_embd, n_tokens, padded);
     }
 
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_tokens = 17)
-        : n_embd(n_embd), n_tokens(n_tokens) {}
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        GGML_ASSERT(n_embd > 0 && n_tokens > 0);
+        return uint64_t(n_embd) * uint64_t(n_tokens) * (2*uint64_t(hc) - 1);
+    }
+
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_tokens = 17, bool padded = false)
+        : n_embd(n_embd), n_tokens(n_tokens), padded(padded) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        constexpr size_t view_offs = 256;
+        constexpr int64_t offset_padding = view_offs / sizeof(float);
+
+        ggml_tensor * x;
+        if (padded) {
+            ggml_tensor * x_backing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd + 3 + offset_padding, hc + 2, n_tokens);
+            ggml_set_name(x_backing, "x_backing");
+            x = ggml_view_3d(ctx, x_backing, n_embd, hc, n_tokens, x_backing->nb[1], x_backing->nb[2], view_offs);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        }
         ggml_set_name(x, "x");
 
-        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * weights;
+        if (padded) {
+            ggml_tensor * weights_backing = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc + 3 + offset_padding, n_tokens);
+            ggml_set_name(weights_backing, "weights_backing");
+            weights = ggml_view_2d(ctx, weights_backing, hc, n_tokens, weights_backing->nb[1], view_offs);
+        } else {
+            weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        }
         ggml_set_name(weights, "weights");
 
-        out = ggml_dsv4_hc_pre(ctx, x, weights);
+        if (padded) {
+            ggml_tensor * out_backing = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + 5 + offset_padding, n_tokens);
+            ggml_set_name(out_backing, "out_backing");
+            out = ggml_view_2d(ctx, out_backing, n_embd, n_tokens, out_backing->nb[1], view_offs);
+            out->op = GGML_OP_DSV4_HC_PRE;
+            out->src[0] = x;
+            out->src[1] = weights;
+        } else {
+            out = ggml_dsv4_hc_pre(ctx, x, weights);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -3891,6 +4056,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
+    const bool padded;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3898,26 +4064,74 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR2(n_embd, n_tokens);
+        return VARS_TO_STR3(n_embd, n_tokens, padded);
     }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17)
-        : n_embd(n_embd), n_tokens(n_tokens) {}
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        GGML_ASSERT(n_embd > 0 && n_tokens > 0);
+        return uint64_t(n_embd) * uint64_t(n_tokens) * uint64_t(hc) * (2*uint64_t(hc) + 1);
+    }
+
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool padded = false)
+        : n_embd(n_embd), n_tokens(n_tokens), padded(padded) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        constexpr size_t view_offs = 256;
+        constexpr int64_t offset_padding = view_offs / sizeof(float);
+
+        ggml_tensor * x;
+        if (padded) {
+            ggml_tensor * x_backing = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + 3 + offset_padding, n_tokens);
+            ggml_set_name(x_backing, "x_backing");
+            x = ggml_view_2d(ctx, x_backing, n_embd, n_tokens, x_backing->nb[1], view_offs);
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        }
         ggml_set_name(x, "x");
 
-        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * residual;
+        if (padded) {
+            ggml_tensor * residual_backing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd + 3 + offset_padding, hc + 2, n_tokens);
+            ggml_set_name(residual_backing, "residual_backing");
+            residual = ggml_view_3d(ctx, residual_backing, n_embd, hc, n_tokens, residual_backing->nb[1], residual_backing->nb[2], view_offs);
+        } else {
+            residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        }
         ggml_set_name(residual, "residual");
 
-        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * post;
+        if (padded) {
+            ggml_tensor * post_backing = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc + 3 + offset_padding, n_tokens);
+            ggml_set_name(post_backing, "post_backing");
+            post = ggml_view_2d(ctx, post_backing, hc, n_tokens, post_backing->nb[1], view_offs);
+        } else {
+            post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        }
         ggml_set_name(post, "post");
 
-        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+        ggml_tensor * comb;
+        if (padded) {
+            ggml_tensor * comb_backing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc + 3 + offset_padding, hc + 2, n_tokens);
+            ggml_set_name(comb_backing, "comb_backing");
+            comb = ggml_view_3d(ctx, comb_backing, hc, hc, n_tokens, comb_backing->nb[1], comb_backing->nb[2], view_offs);
+        } else {
+            comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+        }
         ggml_set_name(comb, "comb");
 
-        out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        if (padded) {
+            ggml_tensor * out_backing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd + 5 + offset_padding, hc + 3, n_tokens);
+            ggml_set_name(out_backing, "out_backing");
+            out = ggml_view_3d(ctx, out_backing, n_embd, hc, n_tokens, out_backing->nb[1], out_backing->nb[2], view_offs);
+            out->op = GGML_OP_DSV4_HC_POST;
+            out->src[0] = x;
+            out->src[1] = residual;
+            out->src[2] = post;
+            out->src[3] = comb;
+        } else {
+            out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -7623,6 +7837,10 @@ struct test_generic_op : public test_case {
                 init_tensor_uniform(t);
             }
         }
+
+        for (ggml_tensor * t : sentinels) {
+            init_tensor_uniform(t);
+        }
     }
 };
 
@@ -8107,18 +8325,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
-    test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
-    test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
+    test_cases.emplace_back(new test_dsv4_hc_comb(1, 1, 0.0f));
+    test_cases.emplace_back(new test_dsv4_hc_comb(17, 4, 1e-6f, true, true));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 20));
 
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
-    test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));
+    test_cases.emplace_back(new test_dsv4_hc_pre(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 21));
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
-    test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
 
@@ -9862,6 +10080,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    test_cases.emplace_back(new test_dsv4_hc_comb(1, 1, 0.0f));
+    test_cases.emplace_back(new test_dsv4_hc_comb(17, 4, 1e-6f, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
+    test_cases.emplace_back(new test_dsv4_hc_comb(17, 20));
+
+    test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
+    test_cases.emplace_back(new test_dsv4_hc_pre(31, 17, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre(128, 257));
+    test_cases.emplace_back(new test_dsv4_hc_pre(4096, 21));
+
+    test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

@@ -1,0 +1,44 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer XBuf { float x[]; };
+layout(binding = 1) readonly buffer ResidualBuf { float residual[]; };
+layout(binding = 2) readonly buffer PostBuf { float post[]; };
+layout(binding = 3) readonly buffer CombBuf { float comb[]; };
+layout(binding = 4) writeonly buffer DstBuf { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_outputs;
+    uint n_embd;
+    uint dispatch_x;
+    uint x_nb1;
+    uint r_nb1;
+    uint r_nb2;
+    uint p_nb1;
+    uint c_nb1;
+    uint c_nb2;
+    uint d_nb1;
+    uint d_nb2;
+};
+
+const uint HC = 4;
+
+void main() {
+    const uint workgroup_idx = gl_WorkGroupID.y * dispatch_x + gl_WorkGroupID.x;
+    const uint output_idx = workgroup_idx * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+
+    if (output_idx >= n_outputs) {
+        return;
+    }
+
+    const uint i = output_idx % n_embd;
+    const uint idst = (output_idx / n_embd) % HC;
+    const uint t = output_idx / (n_embd * HC);
+
+    float sum = x[i + t * x_nb1] * post[idst + t * p_nb1];
+    for (uint isrc = 0; isrc < HC; ++isrc) {
+        sum += residual[i + isrc * r_nb1 + t * r_nb2] * comb[idst + isrc * c_nb1 + t * c_nb2];
+    }
+    dst[i + idst * d_nb1 + t * d_nb2] = sum;
+}
